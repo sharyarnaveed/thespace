@@ -1,0 +1,169 @@
+import { SIZES, type SizeId } from "@/components/onboarding/model";
+import type { OfficeConfig } from "../config";
+import type { ObjectKind } from "./furniture";
+import type { InteractionId } from "./interactions";
+import type { Theme } from "./themes";
+
+/** Every floor plan is drawn at this base size; bigger offices stretch it. */
+export const BASE_W = 44;
+export const BASE_H = 31;
+
+export type Floor = "wood" | "carpet" | "kitchen" | "tiles" | "concrete";
+
+export interface PlacedObject {
+  kind: ObjectKind | "rug";
+  /** Bottom-left tile of the object. */
+  tx: number;
+  ty: number;
+  /** Width in tiles used to centre walk-through objects (solid ones use their footprint). */
+  w?: number;
+  h?: number;
+  /** Static variant frame (e.g. which painting). */
+  frame?: number;
+  interact?: InteractionId;
+}
+
+export interface Room {
+  name: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const DESKS_BY_TEAM: Record<string, number> = { solo: 2, "2-5": 4, "6-15": 6, "16-50": 10, "50+": 16 };
+
+export const sizeOf = (id: SizeId) => SIZES.find((s) => s.id === id) ?? SIZES[0];
+
+/** Initial desk count from team size, capped by the office size so the map stays light. */
+export const deskCount = (c: OfficeConfig) => Math.min(sizeOf(c.size).desks, DESKS_BY_TEAM[c.teamSize] ?? 4);
+
+/**
+ * Helpers a floor plan uses to lay out walls, rooms and furniture.
+ *
+ * Plans are written in base coordinates (44×31). A bigger office size inserts
+ * `dx` empty columns at `split.x` and `dy` rows at `split.y`: anything past a
+ * split moves out, walls and rooms spanning it stretch, and the plan fills the
+ * new bands (real coordinates, via `put`/`desks`) with extra desks and decor.
+ */
+export class Builder {
+  readonly w: number;
+  readonly h: number;
+  readonly walls: boolean[][];
+  readonly floor: Floor[][];
+  readonly objects: PlacedObject[] = [];
+  readonly rooms: Room[] = [];
+  /** Real columns of the top wall that get windows. */
+  readonly windows: number[] = [];
+
+  constructor(
+    readonly theme: Theme,
+    private rand: () => number,
+    base: Floor,
+    readonly dx: number,
+    readonly dy: number,
+    readonly split: { x: number; y: number },
+  ) {
+    this.w = BASE_W + dx;
+    this.h = BASE_H + dy;
+    this.walls = Array.from({ length: this.h }, () => Array<boolean>(this.w).fill(false));
+    this.floor = Array.from({ length: this.h }, () => Array<Floor>(this.w).fill(base));
+    // Outer shell, with a two-row top wall so windows have a face to sit in, and the main entrance.
+    this.fill(this.walls, 0, 0, this.w, 2, true);
+    this.fill(this.walls, 0, this.h - 1, this.w, 1, true);
+    this.fill(this.walls, 0, 0, 1, this.h, true);
+    this.fill(this.walls, this.w - 1, 0, 1, this.h, true);
+    this.fill(this.walls, 21, this.h - 1, 2, 1, false);
+  }
+
+  /** Base → real coordinates. */
+  X = (x: number) => (x >= this.split.x ? x + this.dx : x);
+  Y = (y: number) => (y >= this.split.y ? y + this.dy : y);
+  at = (x: number, y: number) => ({ x: this.X(x), y: this.Y(y) });
+
+  /** Base rectangle → real one; spans crossing a split stretch across the new band. */
+  private span(x: number, y: number, w: number, h: number) {
+    const sx = x < this.split.x && x + w > this.split.x;
+    const sy = y < this.split.y && y + h > this.split.y;
+    return { x: sx ? x : this.X(x), y: sy ? y : this.Y(y), w: w + (sx ? this.dx : 0), h: h + (sy ? this.dy : 0) };
+  }
+
+  private fill<T>(grid: T[][], x: number, y: number, w: number, h: number, v: T) {
+    for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) grid[j][i] = v;
+  }
+
+  wall(x: number, y: number, w: number, h: number) {
+    const r = this.span(x, y, w, h);
+    this.fill(this.walls, r.x, r.y, r.w, r.h, true);
+    return this;
+  }
+
+  /** Cut a doorway (doors move with the plan but never stretch). */
+  open(x: number, y: number, w: number, h: number) {
+    this.fill(this.walls, this.X(x), this.Y(y), w, h, false);
+    return this;
+  }
+
+  /** Name an area (for the HUD label) and optionally give it its own floor. */
+  room(name: string, x: number, y: number, w: number, h: number, floor?: Floor) {
+    const r = this.span(x, y, w, h);
+    this.rooms.push({ name, ...r });
+    if (floor) this.fill(this.floor, r.x, r.y, r.w, r.h, floor);
+    return this;
+  }
+
+  /** Window columns on the top wall, plus one every four tiles across any new band. */
+  setWindows(xs: number[]) {
+    this.windows.push(...xs.map(this.X));
+    for (let x = this.split.x + 1; x < this.split.x + this.dx; x += 4) this.windows.push(x);
+  }
+
+  /** Place an object in base coordinates. Rugs stretch with the room they sit in. */
+  add(kind: PlacedObject["kind"], tx: number, ty: number, extra: Partial<PlacedObject> = {}) {
+    if (kind === "rug" && extra.w && extra.h) {
+      const r = this.span(tx, ty - extra.h + 1, extra.w, extra.h);
+      return this.put(kind, r.x, r.y + r.h - 1, { ...extra, w: r.w, h: r.h });
+    }
+    return this.put(kind, this.X(tx), this.Y(ty), extra);
+  }
+
+  /** Place an object in real coordinates (inside the new bands). */
+  put(kind: PlacedObject["kind"], x: number, y: number, extra: Partial<PlacedObject> = {}) {
+    this.objects.push({ kind, tx: x, ty: y, ...extra });
+    return this;
+  }
+
+  maybe(chance: number) {
+    return this.rand() < chance;
+  }
+
+  /** Optional plant (base coordinates), more likely in greener styles. */
+  plant(tx: number, ty: number, kind: "plant" | "tree" = "plant") {
+    this.plantAt(this.X(tx), this.Y(ty), kind);
+  }
+
+  plantAt(x: number, y: number, kind: "plant" | "tree" = "plant") {
+    if (this.maybe(this.theme.plants)) this.put(kind, x, y, { interact: "plant" });
+  }
+
+  /** Optional framed picture on a wall face (base coordinates). */
+  art(tx: number, ty: number) {
+    if (this.theme.art) this.add("art", tx, ty, { frame: Math.floor(this.rand() * 6) });
+  }
+
+  /** Desks (real coordinates) with chairs tucked behind; the first one is the player's. */
+  desks(slots: { x: number; y: number }[], interact: InteractionId = "desk") {
+    slots.forEach((d, i) => {
+      const mine = i === 0 && interact === "desk";
+      this.put("desk-chair", d.x, d.y - 1);
+      this.put(mine ? "desk-mine" : "desk", d.x, d.y, { interact: mine ? "my-desk" : interact });
+    });
+  }
+
+  /** Positions from `start` stepping by `step` that fit before `end` (exclusive), each `size` wide. */
+  static run(start: number, end: number, step: number, size: number) {
+    const out: number[] = [];
+    for (let v = start; v + size <= end; v += step) out.push(v);
+    return out;
+  }
+}
